@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from geo_documents.file_sorter import sort_key_from_filename, sorted_paths
-from geo_documents.merger import merge_to_docx_and_pdf
+from geo_documents.merger import merge_to_docx_and_pdf  # ← ИСПРАВЛЕНО
 
 
 class _MergeThread(QThread):
@@ -33,15 +33,15 @@ class _MergeThread(QThread):
     crashed = pyqtSignal(str)
 
     def __init__(
-        self,
-        *,
-        paths: list[Path],
-        out_docx: Path,
-        out_pdf: Path,
-        page_break: bool,
-        insert_titles: bool,
-        dpi: int,
-        lo_path: str | None,
+            self,
+            *,
+            paths: list[Path],
+            out_docx: Path,
+            out_pdf: Path,
+            page_break: bool,
+            insert_titles: bool,
+            dpi: int,
+            lo_path: str | None,
     ) -> None:
         super().__init__()
         self._paths = paths
@@ -132,7 +132,7 @@ class MainWindow(QWidget):
         self.cb_titles.setChecked(False)
         self.sp_dpi = QSpinBox()
         self.sp_dpi.setRange(72, 300)
-        self.sp_dpi.setValue(120)
+        self.sp_dpi.setValue(150)
         self.sp_dpi.setSuffix(" dpi")
         fl.addRow(self.cb_page_break)
         fl.addRow(self.cb_titles)
@@ -145,43 +145,18 @@ class MainWindow(QWidget):
         row_out.addWidget(self.ed_basename, stretch=1)
         root.addLayout(row_out)
 
-        row_lo = QHBoxLayout()
-        row_lo.addWidget(QLabel("soffice.exe (LibreOffice):"))
-        self.ed_soffice = QLineEdit()
-        self.ed_soffice.setPlaceholderText(
-            r"например: C:\Program Files\LibreOffice\program\soffice.exe"
-        )
-        saved_lo = self._settings.value("libreoffice_soffice")
-        if saved_lo:
-            self.ed_soffice.setText(str(saved_lo).strip())
-        btn_lo = QPushButton("Обзор…")
-        btn_lo.clicked.connect(self._pick_soffice)
-        row_lo.addWidget(self.ed_soffice, stretch=1)
-        row_lo.addWidget(btn_lo)
-        root.addLayout(row_lo)
-
         self.btn_merge = QPushButton("Склеить в DOCX и PDF")
         self.btn_merge.clicked.connect(self._merge)
         root.addWidget(self.btn_merge)
 
-        lo_hint = QLabel(
-            "Для экспорта в PDF нужен LibreOffice: укажите путь к soffice.exe выше "
-            "(или переменную окружения LIBREOFFICE_EXECUTABLE). Путь сохраняется между запусками. "
-            "Файлы .doc не читаются и пропускаются."
+        hint = QLabel(
+            "PDF создаётся автономно. "
+            "Альбомные страницы автоматически поворачиваются в книжные.\n"
+            "Файлы .doc не читаются и пропускаются. "
+            "Для качественного PDF положите wkhtmltopdf.exe в папку bin/"
         )
-        lo_hint.setWordWrap(True)
-        root.addWidget(lo_hint)
-
-    def _pick_soffice(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Выберите soffice.exe",
-            r"C:\Program Files\LibreOffice\program",
-            "Исполняемые файлы (soffice.exe);;Все файлы (*.*)",
-        )
-        if path:
-            self.ed_soffice.setText(path)
-            self._settings.setValue("libreoffice_soffice", path)
+        hint.setWordWrap(True)
+        root.addWidget(hint)
 
     def _pick_folder(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Папка с документами", str(self._folder))
@@ -272,7 +247,6 @@ class MainWindow(QWidget):
         out_dir = self._folder if self._folder.is_dir() else Path.cwd()
         out_docx = out_dir / f"{base}.docx"
         out_pdf = out_dir / f"{base}.pdf"
-        lo_path = self.ed_soffice.text().strip() or None
 
         th = _MergeThread(
             paths=paths,
@@ -281,7 +255,7 @@ class MainWindow(QWidget):
             page_break=self.cb_page_break.isChecked(),
             insert_titles=self.cb_titles.isChecked(),
             dpi=int(self.sp_dpi.value()),
-            lo_path=lo_path,
+            lo_path=None,
         )
         self._merge_thread = th
         th.done.connect(self._on_merge_done)
@@ -295,10 +269,6 @@ class MainWindow(QWidget):
         self._merge_thread = None
 
     def _on_merge_done(self, warnings: list[str], errors: list[str]) -> None:
-        lo_path = self.ed_soffice.text().strip() or None
-        if lo_path:
-            self._settings.setValue("libreoffice_soffice", lo_path)
-
         msg_lines: list[str] = []
         base = self.ed_basename.text().strip() or "merged_report"
         out_dir = self._folder if self._folder.is_dir() else Path.cwd()
@@ -323,7 +293,6 @@ class MainWindow(QWidget):
         QMessageBox.critical(
             self,
             "Сбой при склейке",
-            "Произошла внутренняя ошибка (подробности ниже). "
-            "Если используете .exe — пришлите этот текст разработчику.\n\n" + tb,
+            "Произошла внутренняя ошибка (подробности ниже).\n\n" + tb,
         )
         self._merge_ui_unlock()
