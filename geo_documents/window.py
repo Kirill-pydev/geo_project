@@ -6,7 +6,10 @@ from pathlib import Path
 from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QFileDialog,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -14,6 +17,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -27,16 +31,21 @@ class _MergeThread(QThread):
     done = pyqtSignal(bool, str)
     crashed = pyqtSignal(str)
 
-    def __init__(self, input_dir: str, file_order: list[str]) -> None:
+    def __init__(self, input_dir: str, file_order: list[str], output_basename: str) -> None:
         super().__init__()
         self._input_dir = input_dir
         self._file_order = file_order
+        self._output_basename = output_basename
 
     def run(self) -> None:
         import traceback
         try:
             from geo_documents.merger import main as merger_main
-            merger_main(input_dir=self._input_dir, file_order=self._file_order)
+            merger_main(
+                input_dir=self._input_dir,
+                file_order=self._file_order,
+                output_basename=self._output_basename
+            )
             self.done.emit(True, "Склейка успешно завершена!")
         except Exception as e:
             self.done.emit(False, str(e))
@@ -59,7 +68,7 @@ class MainWindow(QWidget):
         self._merge_thread: _MergeThread | None = None
 
         self._downloads = Path.home() / "Downloads"
-        self._result_file = self._downloads / "result" / "final_combined_document.docx"
+        self._result_dir = self._downloads / "result"
 
         root = QVBoxLayout(self)
 
@@ -100,15 +109,37 @@ class MainWindow(QWidget):
         row_btns.addStretch(1)
         root.addLayout(row_btns)
 
+        opts = QGroupBox("Параметры склейки")
+        fl = QFormLayout(opts)
+        self.cb_page_break = QCheckBox("Разрыв страницы между файлами")
+        self.cb_page_break.setChecked(True)
+        self.cb_titles = QCheckBox("Вставлять заголовок с именем файла")
+        self.cb_titles.setChecked(False)
+        self.sp_dpi = QSpinBox()
+        self.sp_dpi.setRange(72, 300)
+        self.sp_dpi.setValue(150)
+        self.sp_dpi.setSuffix(" dpi")
+        fl.addRow(self.cb_page_break)
+        fl.addRow(self.cb_titles)
+        fl.addRow("Качество (DPI):", self.sp_dpi)
+        root.addWidget(opts)
+
+        row_out = QHBoxLayout()
+        row_out.addWidget(QLabel("Имя без расширения:"))
+        self.ed_basename = QLineEdit("merged_report")
+        row_out.addWidget(self.ed_basename, stretch=1)
+        root.addLayout(row_out)
+
         self.btn_merge = QPushButton("Склеить в DOCX и PDF")
         self.btn_merge.clicked.connect(self._merge)
         root.addWidget(self.btn_merge)
 
         hint = QLabel(
             "Поддерживаются файлы: .doc, .docx\n"
-            ".doc — прямой бинарный разбор OLE2 (без внешних библиотек)\n"
+            ".doc — конвертация через PowerShell (Word)\n"
             ".docx — полное сохранение форматирования и автопереворот в книжную ориентацию\n"
-            "Приложение на 100% автономное, без MS Word и LibreOffice."
+            "Изображения (.jpg, .png, .bmp, .tiff) и чертежи (.dwg, .dxf) вставляются в конец документа\n"
+            "Приложение полностью автономное, без LibreOffice."
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -207,6 +238,7 @@ class MainWindow(QWidget):
 
         file_order = self._get_file_order()
         input_dir = str(self._folder.resolve())
+        basename = self.ed_basename.text().strip() or "merged_report"
 
         self.btn_merge.setEnabled(False)
         self.btn_merge.setText("Склейка...")
@@ -214,6 +246,7 @@ class MainWindow(QWidget):
         self._merge_thread = _MergeThread(
             input_dir=input_dir,
             file_order=file_order,
+            output_basename=basename,
         )
         self._merge_thread.done.connect(self._on_merge_done)
         self._merge_thread.crashed.connect(self._on_merge_crashed)
@@ -221,10 +254,13 @@ class MainWindow(QWidget):
         self._merge_thread.start()
 
     def _on_merge_done(self, success: bool, message: str) -> None:
+        basename = self.ed_basename.text().strip() or "merged_report"
+        result_file = self._result_dir / f"{basename}.docx"
+
         if success:
             QMessageBox.information(
                 self, "Готово",
-                f"{message}\n\nФайл сохранён:\n{self._result_file}"
+                f"{message}\n\nФайл сохранён:\n{result_file}"
             )
         else:
             QMessageBox.critical(self, "Ошибка", message)

@@ -406,7 +406,7 @@ def insert_images_from_folder(doc, folder_path, max_width_inches=6.0):
             doc.add_paragraph(f"[Ошибка обработки {os.path.basename(dwg_path)}: {e}]")
 
 
-def main(input_dir=None, file_order=None):
+def main(input_dir=None, file_order=None, output_basename="merged_report"):
     if input_dir is None or file_order is None:
         print("Ошибка: Укажите входную папку и порядок файлов.")
         return
@@ -414,7 +414,7 @@ def main(input_dir=None, file_order=None):
     input_dir = os.path.abspath(input_dir)
     downloads_path = Path.home() / "Downloads"
     output_dir = downloads_path / "result"
-    output_file = output_dir / "final_combined_document.docx"
+    output_file = output_dir / f"{output_basename}.docx"
 
     processed_mem_files = {}
 
