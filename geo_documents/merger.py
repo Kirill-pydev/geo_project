@@ -1,175 +1,473 @@
-"""
-Склейщик документов (merger.py).
-Склеивает подготовленные .docx в итоговый документ БЕЗ ПУСТЫХ СТРАНИЦ В НАЧАЛЕ,
-С ИЗОБРАЖЕНИЯМИ И С ЖЕСТКИМ РАЗДЕЛЕНИЕМ ПО СТРАНИЦАМ (каждый файл на своем листе).
-"""
-
-import copy
+import os
+import io
 from pathlib import Path
-from typing import List, Tuple
-
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Inches, Pt
+from docx.enum.section import WD_ORIENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.section import WD_SECTION
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docxcompose.composer import Composer
 
 
-def _remove_last_empty_paragraphs(doc: Document) -> None:
-    """Удаляет пустые параграфы в конце документа, создающие лишние страницы."""
-    while doc.paragraphs:
-        last_para = doc.paragraphs[-1]
-        if not last_para.text.strip() and not last_para._element.findall('.//' + qn('w:drawing')):
-            last_para._element.getparent().remove(last_para._element)
-        else:
-            break
+def set_cell_margins(cell, top=0, bottom=0, left=0, right=0):
+    """Устанавливает поля ячейки таблицы в твипах (1/20 пункта)."""
+    tcPr = cell._tc.get_or_add_tcPr()
+    tcMar = OxmlElement('w:tcMar')
+
+    for name, value in [('top', top), ('bottom', bottom), ('left', left), ('right', right)]:
+        node = OxmlElement(f'w:{name}')
+        node.set(qn('w:w'), str(value))
+        node.set(qn('w:type'), 'dxa')
+        tcMar.append(node)
+
+    existing_tcMar = tcPr.find(qn('w:tcMar'))
+    if existing_tcMar is not None:
+        tcPr.remove(existing_tcMar)
+
+    tcPr.append(tcMar)
 
 
-def _is_paragraph_empty(para_element) -> bool:
-    """Вспомогательная функция для проверки: пустой ли XML-элемент параграфа."""
-    text_elements = para_element.findall('.//' + qn('w:t'))
-    drawing_elements = para_element.findall('.//' + qn('w:drawing'))
-
-    has_content = False
-    for t in text_elements:
-        if t.text and t.text.strip():
-            has_content = True
-            break
-    if drawing_elements:
-        has_content = True
-
-    return not has_content
-
-
-def _copy_images_and_fix_rels(source_doc: Document, target_doc: Document, element_copy) -> None:
-    """Переносит файлы картинок в целевой документ и обновляет ID связей (rId)."""
-    blip_elements = element_copy.findall('.//' + qn('a:blip'))
-    if not blip_elements:
-        return
-
-    source_part = source_doc.part
-    target_part = target_doc.part
-
-    for blip in blip_elements:
-        old_rid = blip.get(qn('r:embed'))
-        if not old_rid:
-            continue
-
-        try:
-            source_rel = source_part.rels[old_rid]
-            image_part = source_rel.target_part
-
-            image_bytes = image_part.blob
-            content_type = image_part.content_type
-
-            # Регистрируем картинку в новом документе
-            new_rid, _ = target_part.get_or_add_image_relationship_by_data(image_bytes, content_type)
-            blip.set(qn('r:embed'), new_rid)
-        except Exception as e:
-            print(f"[Ворнинг] Не удалось скопировать связь изображения {old_rid}: {e}")
-
-
-def merge_to_docx_and_pdf(
-    paths: List[Path],
-    out_docx: Path,
-    out_pdf: Path,
-    page_break_between_parts: bool = True,
-    insert_titles: bool = True,
-    pdf_render_dpi: int = 150,
-) -> Tuple[List[str], List[str]]:
+def scale_landscape_contents_to_portrait(docx_stream):
     """
-    Склеивает список .docx файлов в один итоговый документ.
-    Каждый исходный файл занимает целое количество листов и не сливается со следующим.
+    Находит альбомные секции, переводит их в книжную ориентацию
+    и пропорционально уменьшает размер шрифта, таблиц и картинок,
+    чтобы содержимое гарантированно вписалось в книжный лист.
     """
-    warnings = []
-    errors = []
+    try:
+        doc = Document(docx_stream)
 
-    if not paths:
-        errors.append("Нет файлов для склейки")
-        return warnings, errors
+        for section in doc.sections:
+            if section.orientation == WD_ORIENT.LANDSCAPE:
+                new_width, new_height = section.page_height, section.page_width
+                section.orientation = WD_ORIENT.PORTRAIT
+                section.page_width = new_width
+                section.page_height = new_height
 
-    merged_doc = Document()
+                usable_width = section.page_width - section.left_margin - section.right_margin
+                section_element = section._sectPr
 
-    # Настройка стиля по умолчанию
-    style = merged_doc.styles['Normal']
-    font = style.font
-    font.name = 'Times New Roman'
-    font.size = Pt(12)
+                # Сжатие шрифтов
+                for p_element in section_element.xpath('.//w:p'):
+                    try:
+                        paragraph = doc.paragraphs[doc._paragraphs.index(p_element)]
+                        if paragraph.style and paragraph.style.font and paragraph.style.font.size:
+                            paragraph.style.font.size = Pt(paragraph.style.font.size.pt * 0.8)
+                        for run in paragraph.runs:
+                            if run.font and run.font.size:
+                                run.font.size = Pt(run.font.size.pt * 0.8)
+                            elif run.font:
+                                run.font.size = Pt(9.5)
+                    except:
+                        pass
 
-    # РЕШЕНИЕ ПРОБЛЕМЫ 1: Удаляем абсолютно все пустые параграфы в самом начале,
-    # чтобы итоговый файл не начинался с белого листа
-    for p in list(merged_doc.paragraphs):
-        p._element.getparent().remove(p._element)
+                # Сжатие таблиц
+                for tbl_element in section_element.xpath('.//w:tbl'):
+                    try:
+                        table = doc.tables[doc._tables.index(tbl_element)]
+                        scale_factor = 0.7
+                        table.width = usable_width
 
-    for i, file_path in enumerate(paths):
-        if not file_path.exists():
-            errors.append(f"Файл не найден: {file_path.name}")
-            continue
+                        tblGrid = table._tbl.find(qn('w:tblGrid'))
+                        if tblGrid is not None:
+                            for gridCol in tblGrid.findall(qn('w:gridCol')):
+                                w_attr = gridCol.get(qn('w:w'))
+                                if w_attr is not None:
+                                    new_grid_w = int(int(w_attr) * scale_factor)
+                                    gridCol.set(qn('w:w'), str(new_grid_w))
 
+                        for row in table.rows:
+                            trPr = row._tr.get_or_add_trPr()
+                            trHeight = trPr.find(qn('w:trHeight'))
+                            if trHeight is not None:
+                                trPr.remove(trHeight)
+
+                            for cell in row.cells:
+                                tcPr = cell._tc.get_or_add_tcPr()
+                                tcW = tcPr.find(qn('w:tcW'))
+                                if tcW is not None:
+                                    w_attr = tcW.get(qn('w:w'))
+                                    if w_attr is not None and w_attr.isdigit():
+                                        new_cell_w = int(int(w_attr) * scale_factor)
+                                        tcW.set(qn('w:w'), str(new_cell_w))
+                                        tcW.set(qn('w:type'), 'dxa')
+
+                                try:
+                                    set_cell_margins(cell, top=60, bottom=60, left=80, right=80)
+                                except:
+                                    pass
+
+                                for p in cell.paragraphs:
+                                    if p.paragraph_format:
+                                        p.paragraph_format.space_after = Pt(0)
+                                        p.paragraph_format.space_before = Pt(0)
+                                        p.paragraph_format.line_spacing = 1.0
+                                    for r in p.runs:
+                                        if r.font and r.font.size:
+                                            r.font.size = Pt(max(7.5, r.font.size.pt * 0.8))
+                                        elif r.font:
+                                            r.font.size = Pt(8.5)
+
+                        table.autofit = True
+                    except:
+                        pass
+
+                # Сжатие изображений
+                for shape in doc.inline_shapes:
+                    try:
+                        w = getattr(shape, 'width', None)
+                        h = getattr(shape, 'height', None)
+                        if w is not None and h is not None and isinstance(w, (int, float)):
+                            if w > usable_width:
+                                ratio = usable_width / w
+                                shape.width = int(usable_width)
+                                shape.height = int(h * ratio)
+                    except:
+                        pass
+
+        out_stream = io.BytesIO()
+        doc.save(out_stream)
+        out_stream.seek(0)
+        return out_stream
+    except Exception as e:
+        print(f"Ошибка при масштабировании содержимого: {e}")
+        return docx_stream
+
+
+def convert_doc_to_docx_via_powershell(doc_input_path):
+    """Качественная базовая конвертация .doc в .docx без изменения геометрии."""
+    import tempfile
+    import subprocess
+
+    abs_input = os.path.abspath(doc_input_path)
+    temp_dir = tempfile.gettempdir()
+    base_name = os.path.splitext(os.path.basename(doc_input_path))[0]
+    expected_docx = os.path.join(temp_dir, f"__conv_{base_name}.docx")
+
+    if os.path.exists(expected_docx):
         try:
-            # РЕШЕНИЕ ПРОБЛЕМЫ 2: Чтобы файлы не шли тупо друг за другом и не налезали,
-            # мы принудительно создаем новый чистый раздел (Section) со следующей страницы
-            if i > 0:
-                merged_doc.add_section(WD_SECTION.NEW_PAGE)
+            os.remove(expected_docx)
+        except:
+            pass
 
-            # Вставляем заголовок с именем файла, если требуется
-            if insert_titles:
-                title_para = merged_doc.add_paragraph()
-                title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                title_run = title_para.add_run(file_path.stem)
-                title_run.bold = True
-                title_run.font.size = Pt(14)
-
-                spacer = merged_doc.add_paragraph()
-                spacer.paragraph_format.space_after = Pt(6)
-            elif page_break_between_parts and i > 0 and not insert_titles:
-                # Если заголовков нет, но разрыв просили — он уже создался через add_section выше
+    ps_script = f"""
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    try {{
+        $doc = $word.Documents.Open('{abs_input}')
+        $doc.SaveAs2('{expected_docx}', 16)
+        $doc.Close()
+    }} finally {{
+        $word.Quit()
+    }}
+    """
+    try:
+        subprocess.run(
+            ["powershell", "-Command", ps_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30
+        )
+        if not os.path.exists(expected_docx):
+            return None
+        with open(expected_docx, "rb") as f:
+            mem_stream = io.BytesIO(f.read())
+        return mem_stream
+    except:
+        return None
+    finally:
+        if os.path.exists(expected_docx):
+            try:
+                os.remove(expected_docx)
+            except:
                 pass
 
-            source_doc = Document(str(file_path))
-            _remove_last_empty_paragraphs(source_doc)
 
-            # Перенос элементов тела документа (включая таблицы и картинки)
-            for element in source_doc.element.body:
-                # Пропускаем старые свойства разделов исходника, чтобы они не ломали общую разметку
-                if element.tag.endswith('}sectPr'):
-                    continue
+def try_convert_dwg_to_png(dwg_path):
+    """
+    Конвертирует DWG в PNG через доступные методы.
+    Приоритет: ODA FileConverter → AutoCAD COM → FreeCAD → заглушка.
+    Возвращает BytesIO с PNG или None.
+    """
+    import subprocess
+    import tempfile
 
-                if element.tag.endswith('}p') and _is_paragraph_empty(element):
-                    continue
+    temp_dir = tempfile.gettempdir()
+    base_name = os.path.splitext(os.path.basename(dwg_path))[0]
+    png_output = os.path.join(temp_dir, f"__dwg_{base_name}.png")
 
-                # Глубокое копирование XML-элемента
-                element_copy = copy.deepcopy(element)
+    # ── МЕТОД 1: ODA FileConverter ──
+    odf_paths = [
+        r"C:\Program Files\ODA\ODAFileConverter\ODAFileConverter.exe",
+        r"C:\Program Files (x86)\ODA\ODAFileConverter\ODAFileConverter.exe",
+    ]
 
-                # РЕШЕНИЕ ПРОБЛЕМЫ 3: Восстановление картинок.
-                # Переносим бинарные файлы картинок в архив нового docx и чиним XML rId связи
-                _copy_images_and_fix_rels(source_doc, merged_doc, element_copy)
+    for odf in odf_paths:
+        if os.path.exists(odf):
+            try:
+                subprocess.run(
+                    [odf, dwg_path, png_output, "PNG", "200", "1"],
+                    timeout=60,
+                    capture_output=True
+                )
+                if os.path.exists(png_output) and os.path.getsize(png_output) > 0:
+                    png_buffer = io.BytesIO()
+                    with open(png_output, "rb") as f:
+                        png_buffer.write(f.read())
+                    png_buffer.seek(0)
+                    try:
+                        os.remove(png_output)
+                    except:
+                        pass
+                    return png_buffer
+            except:
+                continue
 
-                # Добавляем элемент в документ
-                merged_doc.element.body.append(element_copy)
+    # ── МЕТОД 2: AutoCAD через COM ──
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+
+        try:
+            from pyautocad import Autocad
+            acad = Autocad(create_if_not_exists=True)
+
+            if acad:
+                doc = acad.Application.Documents.Open(dwg_path)
+                doc.Export(png_output, "PNG")
+                doc.Close(False)
+
+                if os.path.exists(png_output) and os.path.getsize(png_output) > 0:
+                    png_buffer = io.BytesIO()
+                    with open(png_output, "rb") as f:
+                        png_buffer.write(f.read())
+                    png_buffer.seek(0)
+                    try:
+                        os.remove(png_output)
+                    except:
+                        pass
+                    pythoncom.CoUninitialize()
+                    return png_buffer
+        except:
+            pass
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except:
+                pass
+    except ImportError:
+        pass
+
+    # ── МЕТОД 3: FreeCAD ──
+    try:
+        import FreeCAD
+        import importDXF
+
+        doc = FreeCAD.open(dwg_path)
+        FreeCAD.Gui.SendMsgToActiveView("ViewFit")
+        FreeCAD.Gui.activeDocument().activeView().saveImage(png_output, 800, 600, "White")
+        FreeCAD.closeDocument(doc.Name)
+
+        if os.path.exists(png_output) and os.path.getsize(png_output) > 0:
+            png_buffer = io.BytesIO()
+            with open(png_output, "rb") as f:
+                png_buffer.write(f.read())
+            png_buffer.seek(0)
+            try:
+                os.remove(png_output)
+            except:
+                pass
+            return png_buffer
+    except ImportError:
+        pass
+
+    return None
+
+
+def insert_images_from_folder(doc, folder_path, max_width_inches=6.0):
+    """
+    Вставляет все изображения (JPG, PNG, BMP, GIF, TIFF) и DWG/DXF чертежи
+    из папки в конец документа.
+    DWG/DXF конвертируются в PNG через доступные методы.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif'}
+    dwg_extensions = {'.dwg', '.dxf'}
+
+    image_files = []
+    dwg_files = []
+
+    if not os.path.exists(folder_path):
+        return
+
+    for f in sorted(os.listdir(folder_path)):
+        if f.startswith("~$"):
+            continue
+        ext = os.path.splitext(f)[1].lower()
+        full_path = os.path.join(folder_path, f)
+
+        if ext in image_extensions:
+            image_files.append(full_path)
+        elif ext in dwg_extensions:
+            dwg_files.append(full_path)
+
+    # Вставляем обычные изображения
+    for img_path in image_files:
+        try:
+            doc.add_page_break()
+
+            caption = doc.add_paragraph()
+            caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = caption.add_run(f"Приложение: {os.path.basename(img_path)}")
+            run.bold = True
+            run.font.size = Pt(11)
+
+            doc.add_paragraph()
+
+            para = doc.add_paragraph()
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = para.add_run()
+            run.add_picture(img_path, width=Inches(max_width_inches))
 
         except Exception as e:
-            errors.append(f"Ошибка обработки {file_path.name}: {e}")
+            doc.add_paragraph(f"[Ошибка вставки {os.path.basename(img_path)}: {e}]")
 
-    # Финальная чистка хвостов
-    _remove_last_empty_paragraphs(merged_doc)
+    # Вставляем DWG/DXF как картинки
+    for dwg_path in dwg_files:
+        try:
+            doc.add_page_break()
 
-    # 1. Сохраняем DOCX
-    try:
-        merged_doc.save(str(out_docx))
-    except Exception as e:
-        errors.append(f"Ошибка сохранения DOCX: {e}")
-        return warnings, errors
+            caption = doc.add_paragraph()
+            caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = caption.add_run(f"Чертёж: {os.path.basename(dwg_path)}")
+            run.bold = True
+            run.font.size = Pt(11)
 
-    # 2. Сохраняем честный PDF
-    # Так как мы идеально перенесли структуру со всеми картинками внутрь результирующего DOCX,
-    # автономная библиотека docx2pdf соберет идентичный PDF файл со всеми изображениями
-    try:
-        from docx2pdf import convert
-        # Конвертируем сохраненный docx в pdf
-        convert(str(out_docx), str(out_pdf))
-    except Exception as pdf_err:
-        warnings.append(f"Не удалось сгенерировать PDF: {pdf_err}. Проверьте наличие прав доступа.")
+            doc.add_paragraph()
 
-    return warnings, errors
+            png_buffer = try_convert_dwg_to_png(dwg_path)
+
+            if png_buffer:
+                # Вставляем сконвертированное изображение
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = para.add_run()
+                run.add_picture(png_buffer, width=Inches(max_width_inches))
+            else:
+                # Создаём информационную картинку-заглушку
+                file_name = os.path.basename(dwg_path)
+                file_size_kb = os.path.getsize(dwg_path) / 1024
+
+                img_width = 800
+                img_height = 600
+                img = Image.new('RGB', (img_width, img_height), color=(245, 245, 245))
+                draw = ImageDraw.Draw(img)
+
+                draw.rectangle([10, 10, img_width - 11, img_height - 11], outline=(200, 200, 200), width=3)
+
+                try:
+                    font_title = ImageFont.truetype("arial.ttf", 28)
+                    font_info = ImageFont.truetype("arial.ttf", 20)
+                except:
+                    font_title = ImageFont.load_default()
+                    font_info = ImageFont.load_default()
+
+                lines = [
+                    "Чертёж AutoCAD",
+                    "",
+                    f"Файл: {file_name}",
+                    f"Размер: {file_size_kb:.1f} КБ",
+                    "",
+                    "Для отображения чертежа установите:",
+                    "• ODA FileConverter",
+                    "• или AutoCAD",
+                    "• или FreeCAD",
+                ]
+
+                y = 180
+                for i, line in enumerate(lines):
+                    if i == 0:
+                        draw.text((img_width / 2, y), line, fill=(50, 50, 50), font=font_title, anchor="mt")
+                    else:
+                        draw.text((img_width / 2, y), line, fill=(100, 100, 100), font=font_info, anchor="mt")
+                    y += 40
+
+                img_buffer = io.BytesIO()
+                img.save(img_buffer, format='PNG')
+                img_buffer.seek(0)
+
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = para.add_run()
+                run.add_picture(img_buffer, width=Inches(max_width_inches))
+
+        except Exception as e:
+            doc.add_paragraph(f"[Ошибка обработки {os.path.basename(dwg_path)}: {e}]")
+
+
+def main(input_dir=None, file_order=None):
+    if input_dir is None or file_order is None:
+        print("Ошибка: Укажите входную папку и порядок файлов.")
+        return
+
+    input_dir = os.path.abspath(input_dir)
+    downloads_path = Path.home() / "Downloads"
+    output_dir = downloads_path / "result"
+    output_file = output_dir / "final_combined_document.docx"
+
+    processed_mem_files = {}
+
+    print("Шаг 1: Чтение файлов и сжатие альбомного контента...")
+    for filename in os.listdir(input_dir):
+        if filename.startswith("~$"):
+            continue
+
+        full_path = os.path.join(input_dir, filename)
+        name_without_ext, ext = os.path.splitext(filename)
+        ext = ext.lower()
+
+        if ext not in ['.doc', '.docx']:
+            continue
+
+        if ext == '.doc':
+            docx_stream = convert_doc_to_docx_via_powershell(full_path)
+        else:
+            with open(full_path, "rb") as f:
+                docx_stream = io.BytesIO(f.read())
+
+        if docx_stream:
+            scaled_stream = scale_landscape_contents_to_portrait(docx_stream)
+            processed_mem_files[name_without_ext] = scaled_stream
+
+    missing_files = [name for name in file_order if name not in processed_mem_files]
+    if missing_files:
+        print(f"Ошибка: Не найдены файлы: {missing_files}")
+        return
+
+    print("Шаг 2: Сборка итогового документа из памяти...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    first_file_name = file_order[0]
+    base_doc = Document(processed_mem_files[first_file_name])
+    composer = Composer(base_doc)
+
+    for file_name in file_order[1:]:
+        base_doc.add_page_break()
+        next_doc = Document(processed_mem_files[file_name])
+        composer.append(next_doc)
+
+    print("Шаг 3: Вставка изображений и чертежей из папки...")
+    insert_images_from_folder(base_doc, input_dir)
+
+    composer.save(output_file)
+    print(f"\n[УСПЕХ] Документ успешно собран по адресу: {output_file}")
+
+
+if __name__ == "__main__":
+    custom_order = [
+        "1.3 Содержание",
+        "Б. ТЗ на геологию"
+    ]
+    source_folder = r"D:\Pycharm\Projects\GEO_DOCUMENTS\КРАСНАЯ ГОРКА"
+    main(input_dir=source_folder, file_order=custom_order)

@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QFileDialog,
-    QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -18,7 +14,6 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -26,87 +21,25 @@ from PyQt6.QtWidgets import (
 from geo_documents.file_sorter import sort_key_from_filename, sorted_paths
 
 
-class _PreprocessThread(QThread):
-    """Вызывает preprocessor.main() в отдельном потоке."""
+class _MergeThread(QThread):
+    """Вызывает merger.main() в отдельном потоке."""
 
-    done = pyqtSignal(bool, str)  # success, message
-    progress = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
     crashed = pyqtSignal(str)
 
-    def __init__(self, input_dir: str, output_dir: str) -> None:
+    def __init__(self, input_dir: str, file_order: list[str]) -> None:
         super().__init__()
         self._input_dir = input_dir
-        self._output_dir = output_dir
+        self._file_order = file_order
 
     def run(self) -> None:
         import traceback
         try:
-            from geo_documents.preprocessor import main as preprocess_main
-            preprocess_main(input_dir=self._input_dir, output_dir=self._output_dir)
-            self.done.emit(True, "Подготовка завершена")
+            from geo_documents.merger import main as merger_main
+            merger_main(input_dir=self._input_dir, file_order=self._file_order)
+            self.done.emit(True, "Склейка успешно завершена!")
         except Exception as e:
             self.done.emit(False, str(e))
-            self.crashed.emit(traceback.format_exc())
-
-
-class _MergeThread(QThread):
-    """Вызывает merger.py в отдельном потоке."""
-
-    done = pyqtSignal(bool, list, list, str, str)
-    crashed = pyqtSignal(str)
-
-    def __init__(
-            self,
-            *,
-            data_folder: Path,
-            result_folder: Path,
-            basename: str,
-            page_break: bool,
-            insert_titles: bool,
-            dpi: int,
-    ) -> None:
-        super().__init__()
-        self._data_folder = data_folder
-        self._result_folder = result_folder
-        self._basename = basename
-        self._page_break = page_break
-        self._insert_titles = insert_titles
-        self._dpi = dpi
-
-    def run(self) -> None:
-        import traceback
-        try:
-            from geo_documents.merger import merge_to_docx_and_pdf
-            from geo_documents.file_sorter import sorted_paths  # ВОТ ОНО, БЛЯДЬ!
-
-            self._result_folder.mkdir(parents=True, exist_ok=True)
-
-            # Используем sorted_paths вместо sorted()
-            paths = sorted_paths([
-                f for f in self._data_folder.glob("*.docx")
-                if not f.name.startswith("~$")
-            ])
-
-            out_docx = self._result_folder / f"{self._basename}.docx"
-            out_pdf = self._result_folder / f"{self._basename}.pdf"
-
-            warnings, errors = merge_to_docx_and_pdf(
-                paths,
-                out_docx,
-                out_pdf,
-                page_break_between_parts=self._page_break,
-                insert_titles=self._insert_titles,
-                pdf_render_dpi=self._dpi,
-            )
-
-            success = out_docx.exists() and len(errors) == 0
-
-            # Удаляем папку data после успешной склейки
-            if self._data_folder.exists():
-                shutil.rmtree(self._data_folder, ignore_errors=True)
-
-            self.done.emit(success, warnings, errors, str(out_docx), str(out_pdf))
-        except Exception:
             self.crashed.emit(traceback.format_exc())
 
 
@@ -120,16 +53,13 @@ class MainWindow(QWidget):
         self.setWindowTitle("Склейка отчётов (PDF / DOCX / DOC)")
         self.resize(880, 560)
 
-        self._folder = Path.home() / "Downloads"  # По умолчанию Загрузки
+        self._folder = Path.home()
         self._paths: list[Path] = []
         self._settings = QSettings("GEO_DOCUMENTS", "merge_app")
-        self._preprocess_thread: _PreprocessThread | None = None
         self._merge_thread: _MergeThread | None = None
 
-        # Стандартные пути
         self._downloads = Path.home() / "Downloads"
-        self._data_dir = self._downloads / "data"
-        self._result_dir = self._downloads / "result"
+        self._result_file = self._downloads / "result" / "final_combined_document.docx"
 
         root = QVBoxLayout(self)
 
@@ -139,7 +69,7 @@ class MainWindow(QWidget):
         btn_browse.clicked.connect(self._pick_folder)
         btn_scan = QPushButton("Обновить список")
         btn_scan.clicked.connect(self._scan_folder)
-        row1.addWidget(QLabel("Папка с исходными файлами:"))
+        row1.addWidget(QLabel("Папка с файлами:"))
         row1.addWidget(self.ed_folder, stretch=1)
         row1.addWidget(btn_browse)
         row1.addWidget(btn_scan)
@@ -170,41 +100,15 @@ class MainWindow(QWidget):
         row_btns.addStretch(1)
         root.addLayout(row_btns)
 
-        opts = QGroupBox("Параметры склейки")
-        fl = QFormLayout(opts)
-        self.cb_page_break = QCheckBox("Разрыв страницы между файлами")
-        self.cb_page_break.setChecked(True)
-        self.cb_titles = QCheckBox("Вставлять заголовок с именем файла")
-        self.cb_titles.setChecked(False)
-        self.sp_dpi = QSpinBox()
-        self.sp_dpi.setRange(72, 300)
-        self.sp_dpi.setValue(150)
-        self.sp_dpi.setSuffix(" dpi")
-        fl.addRow(self.cb_page_break)
-        fl.addRow(self.cb_titles)
-        fl.addRow("Качество (DPI):", self.sp_dpi)
-        root.addWidget(opts)
-
-        row_out = QHBoxLayout()
-        row_out.addWidget(QLabel("Имя без расширения:"))
-        self.ed_basename = QLineEdit("merged_report")
-        row_out.addWidget(self.ed_basename, stretch=1)
-        root.addLayout(row_out)
-
         self.btn_merge = QPushButton("Склеить в DOCX и PDF")
         self.btn_merge.clicked.connect(self._merge)
         root.addWidget(self.btn_merge)
 
-        self.status_label = QLabel("Готов к работе")
-        self.status_label.setStyleSheet("color: #555; font-weight: bold;")
-        root.addWidget(self.status_label)
-
         hint = QLabel(
-            "1. Выберите папку с исходными .doc/.docx файлами\n"
-            "2. Нажмите «Склеить»\n"
-            "3. Подготовленные файлы → Загрузки/data/\n"
-            "4. Результат склейки → Загрузки/result/\n"
-            "5. Папка data/ удаляется автоматически"
+            "Поддерживаются файлы: .doc, .docx\n"
+            ".doc — прямой бинарный разбор OLE2 (без внешних библиотек)\n"
+            ".docx — полное сохранение форматирования и автопереворот в книжную ориентацию\n"
+            "Приложение на 100% автономное, без MS Word и LibreOffice."
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -225,7 +129,7 @@ class MainWindow(QWidget):
         found: list[Path] = []
         for name in os.listdir(self._folder):
             low = name.lower()
-            if low.endswith((".pdf", ".docx", ".doc")):
+            if low.endswith((".docx", ".doc")):
                 if low.startswith("~$"):
                     continue
                 found.append(self._folder / name)
@@ -247,6 +151,10 @@ class MainWindow(QWidget):
             if data:
                 out.append(Path(str(data)))
         return out
+
+    def _get_file_order(self) -> list[str]:
+        """Имена файлов БЕЗ расширений в GUI-порядке."""
+        return [p.stem for p in self._paths_from_list()]
 
     def _autosort(self) -> None:
         self._paths = sorted_paths(self._paths_from_list())
@@ -272,7 +180,7 @@ class MainWindow(QWidget):
             self,
             "Добавить файлы",
             str(self._folder),
-            "Документы (*.pdf *.docx *.doc);;Все файлы (*.*)",
+            "Документы (*.doc *.docx);;Все файлы (*.*)",
         )
         if not files:
             return
@@ -288,11 +196,8 @@ class MainWindow(QWidget):
             self.list_w.addItem(it)
 
     def _merge(self) -> None:
-        if self._preprocess_thread and self._preprocess_thread.isRunning():
-            QMessageBox.warning(self, "Занято", "Идёт подготовка файлов...")
-            return
         if self._merge_thread and self._merge_thread.isRunning():
-            QMessageBox.warning(self, "Занято", "Идёт склейка...")
+            QMessageBox.warning(self, "Занято", "Идёт склейка, подождите...")
             return
 
         paths = self._paths_from_list()
@@ -300,72 +205,34 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "Склейка", "Список файлов пуст.")
             return
 
-        # Очищаем старую data/ если есть
-        if self._data_dir.exists():
-            shutil.rmtree(self._data_dir, ignore_errors=True)
-
-        # Берём исходную папку НАПРЯМУЮ — preprocessor сам разберётся
+        file_order = self._get_file_order()
         input_dir = str(self._folder.resolve())
 
         self.btn_merge.setEnabled(False)
-        self.status_label.setText("⚙ Шаг 1/2: Подготовка файлов...")
+        self.btn_merge.setText("Склейка...")
 
-        # Шаг 1: preprocessor.py (читает из input_dir, сохраняет в data_dir)
-        self._preprocess_thread = _PreprocessThread(
-            input_dir=input_dir,
-            output_dir=str(self._data_dir)
-        )
-        self._preprocess_thread.done.connect(self._on_preprocess_done)
-        self._preprocess_thread.crashed.connect(self._on_preprocess_crashed)
-        self._preprocess_thread.finished.connect(self._preprocess_thread.deleteLater)
-        self._preprocess_thread.start()
-
-    def _on_preprocess_done(self, success: bool, message: str) -> None:
-        if not success:
-            self.status_label.setText("❌ Ошибка подготовки")
-            QMessageBox.critical(self, "Ошибка", f"Препроцессор:\n{message}")
-            self.btn_merge.setEnabled(True)
-            return
-
-        self.status_label.setText("✅ Шаг 1/2 готов. Шаг 2/2: Склейка...")
-
-        # Шаг 2: merger.py (читает из data_dir, сохраняет в result_dir)
         self._merge_thread = _MergeThread(
-            data_folder=self._data_dir,
-            result_folder=self._result_dir,
-            basename=self.ed_basename.text().strip() or "merged_report",
-            page_break=self.cb_page_break.isChecked(),
-            insert_titles=self.cb_titles.isChecked(),
-            dpi=self.sp_dpi.value(),
+            input_dir=input_dir,
+            file_order=file_order,
         )
         self._merge_thread.done.connect(self._on_merge_done)
         self._merge_thread.crashed.connect(self._on_merge_crashed)
         self._merge_thread.finished.connect(self._merge_thread.deleteLater)
         self._merge_thread.start()
 
-    def _on_preprocess_crashed(self, tb: str) -> None:
-        QMessageBox.critical(self, "Сбой", f"Ошибка препроцессора:\n\n{tb}")
-        self.status_label.setText("❌ Сбой")
+    def _on_merge_done(self, success: bool, message: str) -> None:
+        if success:
+            QMessageBox.information(
+                self, "Готово",
+                f"{message}\n\nФайл сохранён:\n{self._result_file}"
+            )
+        else:
+            QMessageBox.critical(self, "Ошибка", message)
+
         self.btn_merge.setEnabled(True)
-
-    def _on_merge_done(self, success: bool, warnings: list, errors: list, docx_path: str, pdf_path: str) -> None:
-        msg_lines = ["✅ Готово!"]
-
-        if Path(docx_path).exists():
-            msg_lines.append(f"📄 DOCX: {docx_path}")
-        if Path(pdf_path).exists():
-            msg_lines.append(f"📄 PDF: {pdf_path}")
-
-        if warnings:
-            msg_lines.append("\n⚠ Предупреждения:\n- " + "\n- ".join(warnings))
-        if errors:
-            msg_lines.append("\n❌ Ошибки:\n- " + "\n- ".join(errors))
-
-        QMessageBox.information(self, "Результат", "\n".join(msg_lines))
-        self.status_label.setText(f"✅ Готово! Результат в {self._result_dir}")
-        self.btn_merge.setEnabled(True)
+        self.btn_merge.setText("Склеить в DOCX и PDF")
 
     def _on_merge_crashed(self, tb: str) -> None:
-        QMessageBox.critical(self, "Сбой склейки", tb)
-        self.status_label.setText("❌ Сбой")
+        QMessageBox.critical(self, "Сбой при склейке", tb)
         self.btn_merge.setEnabled(True)
+        self.btn_merge.setText("Склеить в DOCX и PDF")
