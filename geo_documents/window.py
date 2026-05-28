@@ -23,30 +23,44 @@ from PyQt6.QtWidgets import (
 )
 
 from geo_documents.file_sorter import sort_key_from_filename, sorted_paths
+from geo_documents.libreoffice import find_soffice
+from geo_documents.merger import MergeOptions, merge_to_docx_and_pdf
 
 
 class _MergeThread(QThread):
-    """Вызывает merger.main() в отдельном потоке."""
+    """Вызывает merge_to_docx_and_pdf в отдельном потоке."""
 
     done = pyqtSignal(bool, str)
     crashed = pyqtSignal(str)
 
-    def __init__(self, input_dir: str, file_order: list[str], output_basename: str) -> None:
+    def __init__(
+        self,
+        ordered_paths: list[str],
+        output_basename: str,
+        options: MergeOptions,
+    ) -> None:
         super().__init__()
-        self._input_dir = input_dir
-        self._file_order = file_order
+        self._ordered_paths = ordered_paths
         self._output_basename = output_basename
+        self._options = options
 
     def run(self) -> None:
         import traceback
+
         try:
-            from geo_documents.merger import main as merger_main
-            merger_main(
-                input_dir=self._input_dir,
-                file_order=self._file_order,
-                output_basename=self._output_basename
+            result = merge_to_docx_and_pdf(
+                ordered_paths=self._ordered_paths,
+                output_basename=self._output_basename,
+                options=self._options,
             )
-            self.done.emit(True, "Склейка успешно завершена!")
+            lines = ["Склейка успешно завершена!", "", f"DOCX:\n{result.docx_path}"]
+            if result.explanatory_note_added:
+                lines.append("\nПояснительная записка добавлена в документ.")
+            if result.pdf_path:
+                lines.extend(["", f"PDF:\n{result.pdf_path}"])
+            for warning in result.warnings:
+                lines.extend(["", f"⚠ {warning}"])
+            self.done.emit(True, "\n".join(lines))
         except Exception as e:
             self.done.emit(False, str(e))
             self.crashed.emit(traceback.format_exc())
@@ -60,15 +74,12 @@ class MainWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Склейка отчётов (PDF / DOCX / DOC)")
-        self.resize(880, 560)
+        self.resize(880, 620)
 
         self._folder = Path.home()
         self._paths: list[Path] = []
         self._settings = QSettings("GEO_DOCUMENTS", "merge_app")
         self._merge_thread: _MergeThread | None = None
-
-        self._downloads = Path.home() / "Downloads"
-        self._result_dir = self._downloads / "result"
 
         root = QVBoxLayout(self)
 
@@ -119,10 +130,32 @@ class MainWindow(QWidget):
         self.sp_dpi.setRange(72, 300)
         self.sp_dpi.setValue(150)
         self.sp_dpi.setSuffix(" dpi")
+        self.cb_export_pdf = QCheckBox("Экспортировать PDF через LibreOffice")
+        self.cb_export_pdf.setChecked(True)
+        self.cb_explanatory_note = QCheckBox("Пояснительная записка (GigaChat)")
+        self.cb_explanatory_note.setChecked(True)
+        self.cb_page_numbers = QCheckBox("Нумерация страниц (внизу по центру)")
+        self.cb_page_numbers.setChecked(True)
         fl.addRow(self.cb_page_break)
         fl.addRow(self.cb_titles)
-        fl.addRow("Качество (DPI):", self.sp_dpi)
+        fl.addRow("Качество PDF (DPI):", self.sp_dpi)
+        fl.addRow(self.cb_export_pdf)
+        fl.addRow(self.cb_explanatory_note)
+        fl.addRow(self.cb_page_numbers)
         root.addWidget(opts)
+
+        row_soffice = QHBoxLayout()
+        row_soffice.addWidget(QLabel("LibreOffice (soffice.exe):"))
+        self.ed_soffice = QLineEdit()
+        saved_soffice = self._settings.value("soffice_path", "", str)
+        detected = find_soffice(preferred=saved_soffice or None)
+        self.ed_soffice.setText(saved_soffice or (detected or ""))
+        self.ed_soffice.setPlaceholderText("Автопоиск или путь к soffice.exe")
+        btn_soffice = QPushButton("Обзор…")
+        btn_soffice.clicked.connect(self._pick_soffice)
+        row_soffice.addWidget(self.ed_soffice, stretch=1)
+        row_soffice.addWidget(btn_soffice)
+        root.addLayout(row_soffice)
 
         row_out = QHBoxLayout()
         row_out.addWidget(QLabel("Имя без расширения:"))
@@ -135,11 +168,14 @@ class MainWindow(QWidget):
         root.addWidget(self.btn_merge)
 
         hint = QLabel(
-            "Поддерживаются файлы: .doc, .docx\n"
-            ".doc — конвертация через PowerShell (Word)\n"
-            ".docx — полное сохранение форматирования и автопереворот в книжную ориентацию\n"
-            "Изображения (.jpg, .png, .bmp, .tiff) и чертежи (.dwg, .dxf) вставляются в конец документа\n"
-            "Приложение полностью автономное, без LibreOffice."
+            "Поддерживаются файлы: .pdf, .doc, .docx\n"
+            "• PDF — растеризация страниц (PyMuPDF), качество задаётся DPI\n"
+            "• DOC — конвертация через Word или LibreOffice\n"
+            "• DOCX — сохранение форматирования и автопереворот альбомных страниц\n"
+            "Пояснительная записка (выжимка) формируется через GigaChat и вставляется "
+            "перед изображениями и чертежами\n"
+            "Изображения и чертежи (.jpg, .png, .dwg, .dxf) из папки добавляются в конец\n"
+            "Результат сохраняется в выбранной папке: имя.docx и имя.pdf"
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -151,6 +187,16 @@ class MainWindow(QWidget):
             self.ed_folder.setText(str(self._folder))
             self._scan_folder()
 
+    def _pick_soffice(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "LibreOffice soffice.exe",
+            self.ed_soffice.text() or "C:\\Program Files",
+            "Исполняемые файлы (soffice.exe);;Все файлы (*.*)",
+        )
+        if path:
+            self.ed_soffice.setText(path)
+
     def _scan_folder(self) -> None:
         self._folder = Path(self.ed_folder.text().strip() or ".")
         self.ed_folder.setText(str(self._folder))
@@ -160,7 +206,7 @@ class MainWindow(QWidget):
         found: list[Path] = []
         for name in os.listdir(self._folder):
             low = name.lower()
-            if low.endswith((".docx", ".doc")):
+            if low.endswith((".pdf", ".docx", ".doc")):
                 if low.startswith("~$"):
                     continue
                 found.append(self._folder / name)
@@ -182,10 +228,6 @@ class MainWindow(QWidget):
             if data:
                 out.append(Path(str(data)))
         return out
-
-    def _get_file_order(self) -> list[str]:
-        """Имена файлов БЕЗ расширений в GUI-порядке."""
-        return [p.stem for p in self._paths_from_list()]
 
     def _autosort(self) -> None:
         self._paths = sorted_paths(self._paths_from_list())
@@ -211,7 +253,7 @@ class MainWindow(QWidget):
             self,
             "Добавить файлы",
             str(self._folder),
-            "Документы (*.doc *.docx);;Все файлы (*.*)",
+            "Документы (*.pdf *.doc *.docx);;Все файлы (*.*)",
         )
         if not files:
             return
@@ -226,6 +268,20 @@ class MainWindow(QWidget):
             it.setData(Qt.ItemDataRole.UserRole, key)
             self.list_w.addItem(it)
 
+    def _build_merge_options(self) -> MergeOptions:
+        soffice_text = self.ed_soffice.text().strip()
+        self._settings.setValue("soffice_path", soffice_text)
+        return MergeOptions(
+            page_break_between_files=self.cb_page_break.isChecked(),
+            insert_file_titles=self.cb_titles.isChecked(),
+            pdf_dpi=self.sp_dpi.value(),
+            output_dir=self._folder.resolve(),
+            soffice_path=soffice_text or None,
+            export_pdf=self.cb_export_pdf.isChecked(),
+            generate_explanatory_note=self.cb_explanatory_note.isChecked(),
+            add_page_numbers=self.cb_page_numbers.isChecked(),
+        )
+
     def _merge(self) -> None:
         if self._merge_thread and self._merge_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Идёт склейка, подождите...")
@@ -236,17 +292,16 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "Склейка", "Список файлов пуст.")
             return
 
-        file_order = self._get_file_order()
-        input_dir = str(self._folder.resolve())
         basename = self.ed_basename.text().strip() or "merged_report"
+        options = self._build_merge_options()
 
         self.btn_merge.setEnabled(False)
         self.btn_merge.setText("Склейка...")
 
         self._merge_thread = _MergeThread(
-            input_dir=input_dir,
-            file_order=file_order,
+            ordered_paths=[str(p) for p in paths],
             output_basename=basename,
+            options=options,
         )
         self._merge_thread.done.connect(self._on_merge_done)
         self._merge_thread.crashed.connect(self._on_merge_crashed)
@@ -254,14 +309,8 @@ class MainWindow(QWidget):
         self._merge_thread.start()
 
     def _on_merge_done(self, success: bool, message: str) -> None:
-        basename = self.ed_basename.text().strip() or "merged_report"
-        result_file = self._result_dir / f"{basename}.docx"
-
         if success:
-            QMessageBox.information(
-                self, "Готово",
-                f"{message}\n\nФайл сохранён:\n{result_file}"
-            )
+            QMessageBox.information(self, "Готово", message)
         else:
             QMessageBox.critical(self, "Ошибка", message)
 
