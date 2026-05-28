@@ -332,27 +332,16 @@ def extract_text_from_path(path: Path, options: MergeOptions) -> str:
     return ""
 
 
-def collect_report_text(paths: list[Path], options: MergeOptions) -> tuple[str, list[str]]:
-    """Собирает текст файлов с нумерованными источниками для ссылок в записке."""
+def collect_report_text(paths: list[Path], options: MergeOptions) -> str:
+    """Собирает текст файлов для передачи в GigaChat."""
     chunks: list[str] = []
-    source_labels: list[str] = []
 
-    for index, path in enumerate(paths, start=1):
-        source_id = f"Источник {index}"
-        label = f'{source_id}: «{path.name}»'
-        source_labels.append(label)
+    for path in paths:
         text = extract_text_from_path(path, options).strip()
         if text:
-            chunks.append(f"--- {label} ---\n{text}")
+            chunks.append(f"--- «{path.name}» ---\n{text}")
 
-    if not chunks:
-        return "", source_labels
-
-    registry = (
-        "Реестр исходных материалов (единственный допустимый источник фактов):\n"
-        + "\n".join(f"- {label}" for label in source_labels)
-    )
-    return registry + "\n\n" + "\n\n".join(chunks), source_labels
+    return "\n\n".join(chunks)
 
 
 def _append_field(paragraph, instruction: str, placeholder: str = "1") -> None:
@@ -387,10 +376,17 @@ def _append_page_field(paragraph) -> None:
 
 
 def _append_cumulative_page_field(paragraph, bookmark_name: str) -> None:
-    """
-    Сквозной номер страницы документа при локальном сбросе PAGE в секции:
-    = PAGE + PAGEREF bookmark
-    """
+    """Сквозной номер: = PAGE + PAGEREF bookmark (устаревший подход)."""
+    _append_formula_page_field(paragraph, bookmark_name, operator="+")
+
+
+def _append_local_page_field(paragraph, bookmark_name: str) -> None:
+    """Локальный номер блока: = PAGE - PAGEREF bookmark + 1."""
+    _append_formula_page_field(paragraph, bookmark_name, operator="-")
+
+
+def _append_formula_page_field(paragraph, bookmark_name: str, *, operator: str) -> None:
+    """Поле = PAGE +/- PAGEREF bookmark (+1 для локального номера)."""
     run = paragraph.add_run()
 
     def _fld_char(field_type: str) -> None:
@@ -409,19 +405,23 @@ def _append_cumulative_page_field(paragraph, bookmark_name: str) -> None:
         element.text = text
         run._r.append(element)
 
+    tail = " + 1" if operator == "-" else ""
+
     _fld_char("begin")
-    _instr(" = ")
+    _instr(f" = ")
     _fld_char("begin")
     _instr(" PAGE ")
     _fld_char("separate")
     _placeholder("1")
     _fld_char("end")
-    _instr(" + ")
+    _instr(f" {operator} ")
     _fld_char("begin")
     _instr(f" PAGEREF {bookmark_name} \\h ")
     _fld_char("separate")
-    _placeholder("0")
+    _placeholder("1")
     _fld_char("end")
+    if tail:
+        _instr(tail)
     _fld_char("separate")
     _placeholder("1")
     _fld_char("end")
@@ -509,60 +509,80 @@ def _set_section_page_start(section, start: int = 1) -> None:
     pg_num_type.set(qn("w:start"), str(start))
 
 
-def apply_dual_page_numbering(doc: Document, block_start_indices: list[int]) -> None:
-    """
-    Верхний колонтитул справа — номер страницы по всему документу.
-    Нижний колонтитул справа — номер страницы внутри текущего блока (файла).
+def _strip_all_page_restarts(doc: Document) -> None:
+    """Удаляет pgNumType из всех разделов — иначе PAGE сбрасывается внутри файла."""
+    for sect_pr in doc.element.body.iter(qn("w:sectPr")):
+        pg_num_type = sect_pr.find(qn("w:pgNumType"))
+        if pg_num_type is not None:
+            sect_pr.remove(pg_num_type)
 
-    Word сбрасывает PAGE в header и footer одновременно, поэтому:
-    - footer: локальный PAGE со сбросом pgNumType в начале каждого блока;
-    - header: PAGE + PAGEREF на конец предыдущего блока (сквозная нумерация).
+
+def _block_section_ranges(block_starts: list[int], section_count: int) -> dict[int, int]:
+    """Индекс раздела -> индекс раздела, с которого начинается текущий блок."""
+    starts = sorted(set(block_starts))
+    mapping: dict[int, int] = {}
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else section_count
+        for section_index in range(start, end):
+            mapping[section_index] = start
+    return mapping
+
+
+def _enable_update_fields_on_open(doc: Document) -> None:
+    """Просит Word обновить поля PAGE/PAGEREF при открытии документа."""
+    settings = doc.settings.element
+    update_fields = settings.find(qn("w:updateFields"))
+    if update_fields is None:
+        update_fields = OxmlElement("w:updateFields")
+        settings.append(update_fields)
+    update_fields.set(qn("w:val"), "true")
+
+
+def apply_dual_page_numbering(doc: Document, section_start_indices: list[int]) -> None:
     """
-    block_starts = sorted(set(block_start_indices))
-    _, last_paragraphs = _map_sections_to_paragraphs(doc)
+    Правый верхний колонтитул — номер страницы по всему итоговому документу.
+    Правый нижний колонтитул — номер страницы в текущем разделе (склеиваемый файл
+    или пояснительная записка): = PAGE - PAGEREF GeoReportSection + 1.
+    """
+    report_section_starts = sorted(set(section_start_indices))
+    first_paragraphs, _ = _map_sections_to_paragraphs(doc)
+    _strip_all_page_restarts(doc)
+    _enable_update_fields_on_open(doc)
 
     bookmark_id = _next_bookmark_id(doc)
-    block_start_bookmarks: dict[int, str] = {}
+    section_bookmarks: dict[int, str] = {}
 
-    for block_index, start_section in enumerate(block_starts[1:], start=1):
-        end_section = start_section - 1
-        if end_section < 0 or end_section >= len(last_paragraphs):
+    for section_index, start_section in enumerate(report_section_starts):
+        if start_section >= len(first_paragraphs):
             continue
-        bookmark_name = f"GeoBlockEnd_{block_index - 1}"
-        _add_bookmark(last_paragraphs[end_section], bookmark_name, bookmark_id)
+        bookmark_name = f"GeoReportSection_{section_index}"
+        _add_bookmark(first_paragraphs[start_section], bookmark_name, bookmark_id)
         bookmark_id += 1
-        block_start_bookmarks[start_section] = bookmark_name
+        section_bookmarks[start_section] = bookmark_name
 
-    first_header = doc.sections[0].header
-    first_header.is_linked_to_previous = False
-    _clear_header(first_header)
-    header_paragraph = first_header.add_paragraph()
-    header_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    _append_page_field(header_paragraph)
+    section_to_report = _block_section_ranges(
+        report_section_starts, len(doc.sections)
+    )
 
     for index, section in enumerate(doc.sections):
-        if index in block_start_bookmarks:
-            section.header.is_linked_to_previous = False
-            _clear_header(section.header)
-            header_paragraph = section.header.add_paragraph()
-            header_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            _append_cumulative_page_field(
-                header_paragraph, block_start_bookmarks[index]
-            )
-        else:
-            section.header.is_linked_to_previous = index > 0
+        header = section.header
+        header.is_linked_to_previous = False
+        _clear_header(header)
+        header_paragraph = header.add_paragraph()
+        header_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _append_page_field(header_paragraph)
 
+        report_start = section_to_report.get(index, report_section_starts[0])
         footer = section.footer
-        if index in block_starts:
-            footer.is_linked_to_previous = False
-            _clear_footer(footer)
-            footer_paragraph = footer.add_paragraph()
-            footer_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            _append_page_field(footer_paragraph)
-            if index > 0:
-                _set_section_page_start(section, 1)
+        footer.is_linked_to_previous = False
+        _clear_footer(footer)
+        footer_paragraph = footer.add_paragraph()
+        footer_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        bookmark_name = section_bookmarks.get(report_start)
+        if bookmark_name:
+            _append_local_page_field(footer_paragraph, bookmark_name)
         else:
-            footer.is_linked_to_previous = True
+            _append_page_field(footer_paragraph)
 
 
 def add_page_numbers_to_document(doc: Document) -> None:
@@ -611,17 +631,14 @@ def _append_fragment(
 _CITATION_RE = re.compile(r"\[ист\.:[^\]]+\]", re.IGNORECASE)
 
 
-def _add_text_with_source_citations(paragraph, text: str) -> None:
-    """Вставляет текст; ссылки [ист.: …] выделяются курсивом."""
-    pos = 0
-    for match in _CITATION_RE.finditer(text):
-        if match.start() > pos:
-            paragraph.add_run(text[pos : match.start()])
-        cite_run = paragraph.add_run(match.group())
-        cite_run.italic = True
-        pos = match.end()
-    if pos < len(text):
-        paragraph.add_run(text[pos:])
+def _strip_inline_citations(text: str) -> str:
+    cleaned = _CITATION_RE.sub("", text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def _add_note_text(paragraph, text: str) -> None:
+    paragraph.add_run(_strip_inline_citations(text))
 
 
 def insert_explanatory_note(doc: Document, note_text: str) -> None:
@@ -694,20 +711,20 @@ def insert_explanatory_note(doc: Document, note_text: str) -> None:
         elif list_re.match(stripped):
             paragraph.paragraph_format.left_indent = Pt(36)
             paragraph.paragraph_format.first_line_indent = Pt(-14)
-            _add_text_with_source_citations(paragraph, stripped)
+            _add_note_text(paragraph, stripped)
         else:
             paragraph.paragraph_format.left_indent = Pt(36 if in_subsection else 18)
-            _add_text_with_source_citations(paragraph, stripped)
+            _add_note_text(paragraph, stripped)
 
 
 def generate_explanatory_note(paths: list[Path], options: MergeOptions) -> str:
-    report_text, source_labels = collect_report_text(paths, options)
+    report_text = collect_report_text(paths, options)
     if not report_text.strip():
         raise RuntimeError(
             "Не удалось извлечь текст из документов для пояснительной записки."
         )
 
-    prompt = build_explanatory_note_prompt(report_text, source_labels)
+    prompt = build_explanatory_note_prompt(report_text)
     response = call_simple(
         prompt,
         url=options.gigachat_url,

@@ -134,7 +134,9 @@ class MainWindow(QWidget):
         self.cb_export_pdf.setChecked(True)
         self.cb_explanatory_note = QCheckBox("Пояснительная записка (GigaChat)")
         self.cb_explanatory_note.setChecked(True)
-        self.cb_page_numbers = QCheckBox("Нумерация: вверху справа (документ) / внизу справа (блок)")
+        self.cb_page_numbers = QCheckBox(
+            "Нумерация: вверху справа (весь документ) / внизу справа (раздел)"
+        )
         self.cb_page_numbers.setChecked(True)
         fl.addRow(self.cb_page_break)
         fl.addRow(self.cb_titles)
