@@ -134,7 +134,7 @@ class MainWindow(QWidget):
         self.cb_export_pdf.setChecked(True)
         self.cb_explanatory_note = QCheckBox("Пояснительная записка (GigaChat)")
         self.cb_explanatory_note.setChecked(True)
-        self.cb_page_numbers = QCheckBox("Нумерация страниц (внизу по центру)")
+        self.cb_page_numbers = QCheckBox("Нумерация: вверху справа (документ) / внизу справа (блок)")
         self.cb_page_numbers.setChecked(True)
         fl.addRow(self.cb_page_break)
         fl.addRow(self.cb_titles)
@@ -172,8 +172,8 @@ class MainWindow(QWidget):
             "• PDF — растеризация страниц (PyMuPDF), качество задаётся DPI\n"
             "• DOC — конвертация через Word или LibreOffice\n"
             "• DOCX — сохранение форматирования и автопереворот альбомных страниц\n"
-            "Пояснительная записка (выжимка) формируется через GigaChat и вставляется "
-            "перед изображениями и чертежами\n"
+            "Пояснительная записка (раздел 2) вставляется сразу после файла «Содержание»\n"
+            "Нумерация: вверху справа — по всему документу; внизу справа — внутри каждого файла\n"
             "Изображения и чертежи (.jpg, .png, .dwg, .dxf) из папки добавляются в конец\n"
             "Результат сохраняется в выбранной папке: имя.docx и имя.pdf"
         )

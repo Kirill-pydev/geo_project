@@ -10,7 +10,7 @@ from pathlib import Path
 
 import fitz
 from docx import Document
-from docx.enum.section import WD_ORIENT
+from docx.enum.section import WD_ORIENT, WD_SECTION
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -355,21 +355,21 @@ def collect_report_text(paths: list[Path], options: MergeOptions) -> tuple[str, 
     return registry + "\n\n" + "\n\n".join(chunks), source_labels
 
 
-def _append_page_field(paragraph) -> None:
-    """Вставляет поле PAGE (номер страницы) в абзац."""
+def _append_field(paragraph, instruction: str, placeholder: str = "1") -> None:
+    """Вставляет одно поле Word (PAGE, PAGEREF и т.д.) в абзац."""
     run = paragraph.add_run()
     fld_begin = OxmlElement("w:fldChar")
     fld_begin.set(qn("w:fldCharType"), "begin")
 
     instr = OxmlElement("w:instrText")
     instr.set(qn("xml:space"), "preserve")
-    instr.text = " PAGE "
+    instr.text = instruction
 
     fld_sep = OxmlElement("w:fldChar")
     fld_sep.set(qn("w:fldCharType"), "separate")
 
-    placeholder = OxmlElement("w:t")
-    placeholder.text = "1"
+    text = OxmlElement("w:t")
+    text.text = placeholder
 
     fld_end = OxmlElement("w:fldChar")
     fld_end.set(qn("w:fldCharType"), "end")
@@ -377,8 +377,108 @@ def _append_page_field(paragraph) -> None:
     run._r.append(fld_begin)
     run._r.append(instr)
     run._r.append(fld_sep)
-    run._r.append(placeholder)
+    run._r.append(text)
     run._r.append(fld_end)
+
+
+def _append_page_field(paragraph) -> None:
+    """Вставляет поле PAGE (номер страницы) в абзац."""
+    _append_field(paragraph, " PAGE ")
+
+
+def _append_cumulative_page_field(paragraph, bookmark_name: str) -> None:
+    """
+    Сквозной номер страницы документа при локальном сбросе PAGE в секции:
+    = PAGE + PAGEREF bookmark
+    """
+    run = paragraph.add_run()
+
+    def _fld_char(field_type: str) -> None:
+        element = OxmlElement("w:fldChar")
+        element.set(qn("w:fldCharType"), field_type)
+        run._r.append(element)
+
+    def _instr(text: str) -> None:
+        element = OxmlElement("w:instrText")
+        element.set(qn("xml:space"), "preserve")
+        element.text = text
+        run._r.append(element)
+
+    def _placeholder(text: str) -> None:
+        element = OxmlElement("w:t")
+        element.text = text
+        run._r.append(element)
+
+    _fld_char("begin")
+    _instr(" = ")
+    _fld_char("begin")
+    _instr(" PAGE ")
+    _fld_char("separate")
+    _placeholder("1")
+    _fld_char("end")
+    _instr(" + ")
+    _fld_char("begin")
+    _instr(f" PAGEREF {bookmark_name} \\h ")
+    _fld_char("separate")
+    _placeholder("0")
+    _fld_char("end")
+    _fld_char("separate")
+    _placeholder("1")
+    _fld_char("end")
+
+
+def _next_bookmark_id(doc: Document) -> int:
+    ids = [
+        int(element.get(qn("w:id")))
+        for element in doc.element.body.iter(qn("w:bookmarkStart"))
+        if element.get(qn("w:id")) is not None
+    ]
+    return max(ids, default=-1) + 1
+
+
+def _add_bookmark(paragraph, name: str, bookmark_id: int) -> None:
+    bookmark_start = OxmlElement("w:bookmarkStart")
+    bookmark_start.set(qn("w:id"), str(bookmark_id))
+    bookmark_start.set(qn("w:name"), name)
+
+    bookmark_end = OxmlElement("w:bookmarkEnd")
+    bookmark_end.set(qn("w:id"), str(bookmark_id))
+
+    element = paragraph._element
+    element.insert(0, bookmark_start)
+    element.append(bookmark_end)
+
+
+def _map_sections_to_paragraphs(doc: Document) -> tuple[list, list]:
+    """Первый и последний абзац каждой секции документа."""
+    from docx.text.paragraph import Paragraph
+
+    first_paragraphs: list = []
+    last_paragraphs: list = []
+    current_first = None
+    current_last = None
+
+    for child in doc.element.body.iterchildren():
+        if child.tag != qn("w:p"):
+            continue
+
+        paragraph = Paragraph(child, doc)
+        if current_first is None:
+            current_first = paragraph
+        current_last = paragraph
+
+        p_pr = child.find(qn("w:pPr"))
+        if p_pr is not None and p_pr.find(qn("w:sectPr")) is not None:
+            first_paragraphs.append(current_first)
+            last_paragraphs.append(current_last)
+            current_first = None
+            current_last = None
+
+    if current_first is not None:
+        first_paragraphs.append(current_first)
+        last_paragraphs.append(current_last)
+
+    return first_paragraphs, last_paragraphs
 
 
 def _clear_footer(footer) -> None:
@@ -387,18 +487,125 @@ def _clear_footer(footer) -> None:
         element.getparent().remove(element)
 
 
-def add_page_numbers_to_document(doc: Document) -> None:
-    """Добавляет сквозную нумерацию страниц по центру нижнего колонтитула."""
-    for index, section in enumerate(doc.sections):
-        footer = section.footer
-        footer.is_linked_to_previous = index > 0
-        if index > 0:
-            continue
+def _clear_header(header) -> None:
+    for paragraph in list(header.paragraphs):
+        element = paragraph._element
+        element.getparent().remove(element)
 
-        _clear_footer(footer)
-        paragraph = footer.add_paragraph()
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        _append_page_field(paragraph)
+
+def _add_block_section_break(doc: Document) -> int:
+    """Новый раздел с новой страницы; возвращает индекс начала блока."""
+    doc.add_section(WD_SECTION.NEW_PAGE)
+    return len(doc.sections) - 1
+
+
+def _set_section_page_start(section, start: int = 1) -> None:
+    """Задаёт начало нумерации страниц для секции (локальный блок)."""
+    sect_pr = section._sectPr
+    pg_num_type = sect_pr.find(qn("w:pgNumType"))
+    if pg_num_type is None:
+        pg_num_type = OxmlElement("w:pgNumType")
+        sect_pr.append(pg_num_type)
+    pg_num_type.set(qn("w:start"), str(start))
+
+
+def apply_dual_page_numbering(doc: Document, block_start_indices: list[int]) -> None:
+    """
+    Верхний колонтитул справа — номер страницы по всему документу.
+    Нижний колонтитул справа — номер страницы внутри текущего блока (файла).
+
+    Word сбрасывает PAGE в header и footer одновременно, поэтому:
+    - footer: локальный PAGE со сбросом pgNumType в начале каждого блока;
+    - header: PAGE + PAGEREF на конец предыдущего блока (сквозная нумерация).
+    """
+    block_starts = sorted(set(block_start_indices))
+    _, last_paragraphs = _map_sections_to_paragraphs(doc)
+
+    bookmark_id = _next_bookmark_id(doc)
+    block_start_bookmarks: dict[int, str] = {}
+
+    for block_index, start_section in enumerate(block_starts[1:], start=1):
+        end_section = start_section - 1
+        if end_section < 0 or end_section >= len(last_paragraphs):
+            continue
+        bookmark_name = f"GeoBlockEnd_{block_index - 1}"
+        _add_bookmark(last_paragraphs[end_section], bookmark_name, bookmark_id)
+        bookmark_id += 1
+        block_start_bookmarks[start_section] = bookmark_name
+
+    first_header = doc.sections[0].header
+    first_header.is_linked_to_previous = False
+    _clear_header(first_header)
+    header_paragraph = first_header.add_paragraph()
+    header_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    _append_page_field(header_paragraph)
+
+    for index, section in enumerate(doc.sections):
+        if index in block_start_bookmarks:
+            section.header.is_linked_to_previous = False
+            _clear_header(section.header)
+            header_paragraph = section.header.add_paragraph()
+            header_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            _append_cumulative_page_field(
+                header_paragraph, block_start_bookmarks[index]
+            )
+        else:
+            section.header.is_linked_to_previous = index > 0
+
+        footer = section.footer
+        if index in block_starts:
+            footer.is_linked_to_previous = False
+            _clear_footer(footer)
+            footer_paragraph = footer.add_paragraph()
+            footer_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            _append_page_field(footer_paragraph)
+            if index > 0:
+                _set_section_page_start(section, 1)
+        else:
+            footer.is_linked_to_previous = True
+
+
+def add_page_numbers_to_document(doc: Document) -> None:
+    """Сохранена для совместимости: двойная нумерация для одного блока."""
+    apply_dual_page_numbering(doc, [0])
+
+
+def _find_content_index(paths: list[Path]) -> int | None:
+    """Индекс файла «Содержание» в списке склейки."""
+    for index, path in enumerate(paths):
+        stem = path.stem.lower()
+        if "содержание" in stem or "содерж" in stem:
+            return index
+    return None
+
+
+def _append_fragment(
+    *,
+    base_doc: Document | None,
+    composer: Composer | None,
+    path: Path,
+    options: MergeOptions,
+    insert_titles: bool,
+) -> tuple[Document, Composer]:
+    fragment_stream = prepare_docx_stream(path, options)
+    fragment = Document(fragment_stream)
+
+    if base_doc is None:
+        if insert_titles:
+            base_doc = Document()
+            _add_file_title(base_doc, path.name)
+            composer = Composer(base_doc)
+            composer.append(fragment)
+        else:
+            base_doc = fragment
+            composer = Composer(base_doc)
+        return base_doc, composer
+
+    if insert_titles:
+        _add_file_title(base_doc, path.name)
+    assert composer is not None
+    composer.append(fragment)
+    return base_doc, composer
 
 
 _CITATION_RE = re.compile(r"\[ист\.:[^\]]+\]", re.IGNORECASE)
@@ -418,9 +625,7 @@ def _add_text_with_source_citations(paragraph, text: str) -> None:
 
 
 def insert_explanatory_note(doc: Document, note_text: str) -> None:
-    """Вставляет пояснительную записку перед приложениями с медиа."""
-    doc.add_page_break()
-
+    """Вставляет пояснительную записку (новый блок задаётся до вызова через разрыв раздела)."""
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title_run = title.add_run(EXPLANATORY_NOTE_TITLE)
@@ -431,6 +636,9 @@ def insert_explanatory_note(doc: Document, note_text: str) -> None:
 
     section_re = re.compile(r"^(\d+\.\d+(?:\.\d+)?)\s+(.+)$")
     list_re = re.compile(r"^(\d+\)|[а-гa-d]\)|[а-гa-d]\.)\s*", re.IGNORECASE)
+    promptish_re = re.compile(r"^(?:\d+\)\s*)?(?:кто|как|какие|имеются|чем|что|до\s+какой|на\s+каком)\b", re.IGNORECASE)
+
+    in_subsection = False
 
     for line in note_text.splitlines():
         stripped = line.strip()
@@ -441,19 +649,54 @@ def insert_explanatory_note(doc: Document, note_text: str) -> None:
         if stripped.startswith("#"):
             stripped = stripped.lstrip("#").strip()
 
-        if stripped == EXPLANATORY_NOTE_TITLE or stripped.startswith("1. Пояснительная записка"):
+        if stripped == EXPLANATORY_NOTE_TITLE or re.match(
+            r"^[12]\.\s*Пояснительная записка", stripped, re.IGNORECASE
+        ):
+            continue
+
+        if stripped.startswith("@Р@"):
+            heading = stripped[3:].strip()
+            in_subsection = False
+            paragraph = doc.add_paragraph()
+            run = paragraph.add_run(heading)
+            run.bold = True
+            run.font.size = Pt(14)
+            paragraph.paragraph_format.space_before = Pt(14)
+            paragraph.paragraph_format.space_after = Pt(6)
+            paragraph.paragraph_format.left_indent = Pt(0)
+            continue
+
+        if stripped.startswith("@П@"):
+            subheading = stripped[3:].strip().rstrip("?")
+            in_subsection = True
+            paragraph = doc.add_paragraph()
+            marker = paragraph.add_run("— ")
+            marker.bold = True
+            marker.font.size = Pt(11)
+            run = paragraph.add_run(subheading)
+            run.bold = True
+            run.font.size = Pt(11)
+            paragraph.paragraph_format.left_indent = Pt(18)
+            paragraph.paragraph_format.first_line_indent = Pt(-10)
+            paragraph.paragraph_format.space_before = Pt(4)
+            paragraph.paragraph_format.space_after = Pt(2)
             continue
 
         paragraph = doc.add_paragraph()
         section_match = section_re.match(stripped)
-        if section_match:
+        if section_match and not promptish_re.match(stripped):
+            in_subsection = False
             run = paragraph.add_run(stripped)
             run.bold = True
-            run.font.size = Pt(12)
+            run.font.size = Pt(14)
+            paragraph.paragraph_format.space_before = Pt(14)
+            paragraph.paragraph_format.space_after = Pt(6)
         elif list_re.match(stripped):
-            paragraph.paragraph_format.left_indent = Pt(18)
+            paragraph.paragraph_format.left_indent = Pt(36)
+            paragraph.paragraph_format.first_line_indent = Pt(-14)
             _add_text_with_source_citations(paragraph, stripped)
         else:
+            paragraph.paragraph_format.left_indent = Pt(36 if in_subsection else 18)
             _add_text_with_source_citations(paragraph, stripped)
 
 
@@ -725,38 +968,51 @@ def merge_to_docx_and_pdf(
 
     base_doc: Document | None = None
     composer: Composer | None = None
+    block_section_starts: list[int] = [0]
+    content_index = _find_content_index(paths)
+    note_text: str | None = None
+    note_inserted = False
 
-    for index, path in enumerate(paths):
-        if index > 0 and options.page_break_between_files and base_doc is not None:
-            base_doc.add_page_break()
-
-        fragment_stream = prepare_docx_stream(path, options)
-        fragment = Document(fragment_stream)
-
-        if index == 0:
-            if options.insert_file_titles:
-                base_doc = Document()
-                _add_file_title(base_doc, path.name)
-                composer = Composer(base_doc)
-                composer.append(fragment)
-            else:
-                base_doc = fragment
-                composer = Composer(base_doc)
-        else:
-            if options.insert_file_titles:
-                assert base_doc is not None
-                _add_file_title(base_doc, path.name)
-            assert composer is not None
-            composer.append(fragment)
-
-    assert base_doc is not None and composer is not None
-
-    explanatory_note_added = False
     if options.generate_explanatory_note:
         try:
             note_text = generate_explanatory_note(paths, options)
+        except Exception as exc:
+            warnings.append(f"Пояснительная записка не сгенерирована: {exc}")
+
+    for index, path in enumerate(paths):
+        if index > 0 and options.page_break_between_files and base_doc is not None:
+            block_section_starts.append(_add_block_section_break(base_doc))
+
+        base_doc, composer = _append_fragment(
+            base_doc=base_doc,
+            composer=composer,
+            path=path,
+            options=options,
+            insert_titles=options.insert_file_titles,
+        )
+
+        insert_after_content = content_index is not None and index == content_index
+        insert_after_first = content_index is None and index == 0
+        if note_text and not note_inserted and (insert_after_content or insert_after_first):
+            block_section_starts.append(_add_block_section_break(base_doc))
+            insert_explanatory_note(base_doc, note_text)
+            note_inserted = True
+            if content_index is None:
+                warnings.append(
+                    "Файл «Содержание» не найден — записка вставлена после первого документа."
+                )
+
+    assert base_doc is not None and composer is not None
+
+    explanatory_note_added = note_inserted
+    if note_text and not note_inserted:
+        try:
+            block_section_starts.append(_add_block_section_break(base_doc))
             insert_explanatory_note(base_doc, note_text)
             explanatory_note_added = True
+            warnings.append(
+                "Записка вставлена в конец документов (не найдено место после «Содержания»)."
+            )
         except Exception as exc:
             warnings.append(f"Пояснительная записка не добавлена: {exc}")
 
@@ -764,7 +1020,7 @@ def merge_to_docx_and_pdf(
         insert_images_from_folder(base_doc, str(input_dir))
 
     if options.add_page_numbers:
-        add_page_numbers_to_document(base_doc)
+        apply_dual_page_numbering(base_doc, block_section_starts)
 
     composer.save(output_docx)
 
